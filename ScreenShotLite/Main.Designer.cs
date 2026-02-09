@@ -31,8 +31,6 @@
             Title = new Label();
             SaveLocationLabel = new Label();
             Panel = new Panel();
-            label3 = new Label();
-            label2 = new Label();
             checkBox7 = new CheckBox();
             button8 = new Button();
             button7 = new Button();
@@ -58,6 +56,8 @@
             label1 = new Label();
             panel1 = new Panel();
             button4 = new Button();
+            label2 = new Label();
+            label3 = new Label();
             Panel.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)numericUpDown2).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numericUpDown1).BeginInit();
@@ -114,24 +114,6 @@
             Panel.Name = "Panel";
             Panel.Size = new Size(698, 269);
             Panel.TabIndex = 2;
-            // 
-            // label3
-            // 
-            label3.AutoSize = true;
-            label3.Location = new Point(590, 237);
-            label3.Name = "label3";
-            label3.Size = new Size(109, 17);
-            label3.TabIndex = 33;
-            label3.Text = "v1.0 ©CEllOMiKA";
-            // 
-            // label2
-            // 
-            label2.AutoSize = true;
-            label2.Location = new Point(91, 237);
-            label2.Name = "label2";
-            label2.Size = new Size(164, 17);
-            label2.TabIndex = 32;
-            label2.Text = "自动截图时再按一次截图停止";
             // 
             // checkBox7
             // 
@@ -372,6 +354,24 @@
             button4.TabIndex = 5;
             button4.Text = "保存日志";
             button4.UseVisualStyleBackColor = true;
+            // 
+            // label2
+            // 
+            label2.AutoSize = true;
+            label2.Location = new Point(91, 237);
+            label2.Name = "label2";
+            label2.Size = new Size(164, 17);
+            label2.TabIndex = 32;
+            label2.Text = "自动截图时再按一次截图停止";
+            // 
+            // label3
+            // 
+            label3.AutoSize = true;
+            label3.Location = new Point(613, 237);
+            label3.Name = "label3";
+            label3.Size = new Size(82, 17);
+            label3.TabIndex = 33;
+            label3.Text = "©CEllOMiKA";
             // 
             // Main
             // 
