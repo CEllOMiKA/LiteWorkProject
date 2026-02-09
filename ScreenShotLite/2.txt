@@ -1,0 +1,1040 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Timers;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+namespace ScreenShotLite
+{
+    public partial class Form1 : Form
+    {
+        private System.Timers.Timer? _autoTimer;
+
+        // Hotkey constants
+        private const int HOTKEY_ID = 0x9000;
+        private const uint MOD_ALT = 0x0001;
+        private const uint MOD_CONTROL = 0x0002;
+        private const uint MOD_SHIFT = 0x0004;
+        private const uint MOD_WIN = 0x0008;
+        private const int WM_HOTKEY = 0x0312;
+
+        // current hotkey state
+        private uint _currentHotkeyModifiers = MOD_CONTROL | MOD_SHIFT;
+        private Keys _currentHotkeyKey = Keys.S;
+
+        // GDI raster op
+        private const uint SRCCOPY = 0x00CC0020;
+
+        // keybd_event constants
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+        private const byte VK_SNAPSHOT = 0x2C;
+        private const byte VK_MENU = 0x12; // Alt
+
+        // ShowWindow
+        private const int SW_RESTORE = 9;
+
+        public Form1()
+        {
+            InitializeComponent();
+
+            // 事件绑定（Designer 中未绑定的在这里绑定）
+            button1.Click += Button1_Click;   // 选择保存位置
+            button2.Click += Button2_Click;   // 打开保存位置
+            button3.Click += Button3_Click;   // 截图
+            button4.Click += Button4_Click;   // 保存日志
+
+            // 热键相关 UI
+            comboBox1.DropDown += (s, e) => PopulateTopLevelWindows();
+            comboBox2.DropDown += (s, e) => PopulateScreens();
+            textBox2.KeyDown += TextBox2_KeyDown;
+            checkBox4.CheckedChanged += CheckBox4_CheckedChanged;
+
+            FormClosing += Form1_FormClosing;
+            HandleCreated += Form1_HandleCreated;
+            HandleDestroyed += Form1_HandleDestroyed;
+            Activated += Form1_Activated;
+
+            // 当显示设置变更（连接/断开显示器）时刷新屏幕列表
+            SystemEvents.DisplaySettingsChanged += SystemEvents_DisplaySettingsChanged;
+
+            // 初始化默认路径与热键显示
+            if (string.IsNullOrWhiteSpace(textBox1.Text))
+                textBox1.Text = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+
+            // 默认热键显示在 textBox2
+            textBox2.Text = HotkeyToString(_currentHotkeyModifiers, _currentHotkeyKey);
+        }
+
+        private void Form1_Activated(object? sender, EventArgs e)
+        {
+            // 当窗体激活时尝试刷新窗口与屏幕（检测新窗口/显示器）
+            PopulateTopLevelWindows();
+            PopulateScreens();
+        }
+
+        private void SystemEvents_DisplaySettingsChanged(object? sender, EventArgs e)
+        {
+            // 显示器变化时刷新屏幕列表（UI 线程）
+            try
+            {
+                if (!IsDisposed)
+                    this.BeginInvoke((Action)PopulateScreens);
+            }
+            catch { }
+        }
+
+        private void Form1_HandleCreated(object? sender, EventArgs e)
+        {
+            // 仅在勾选热键启用时注册默认热键
+            if (checkBox4.Checked)
+                RegisterCurrentHotkey();
+        }
+
+        private void Form1_HandleDestroyed(object? sender, EventArgs e)
+        {
+            UnregisterHotKey(Handle, HOTKEY_ID);
+        }
+
+        private void Form1_FormClosing(object? sender, FormClosingEventArgs e)
+        {
+            _autoTimer?.Stop();
+            _autoTimer?.Dispose();
+            UnregisterHotKey(Handle, HOTKEY_ID);
+            SystemEvents.DisplaySettingsChanged -= SystemEvents_DisplaySettingsChanged;
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
+            {
+                OnHotKeyPressed();
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        private void CheckBox4_CheckedChanged(object? sender, EventArgs e)
+        {
+            if (checkBox4.Checked)
+            {
+                // 注册热键（基于 textBox2 中设置）
+                RegisterCurrentHotkey();
+                Log($"已启用热键：{textBox2.Text}");
+            }
+            else
+            {
+                UnregisterHotKey(Handle, HOTKEY_ID);
+                Log("已禁用热键。");
+            }
+        }
+
+        private void TextBox2_KeyDown(object? sender, KeyEventArgs e)
+        {
+            // 捕获用户在 textBox2 中按下的组合键：更新显示和注册
+            e.SuppressKeyPress = true;
+            e.Handled = true;
+
+            // 忽略单独的修饰键（Ctrl/Alt/Shift/Win）
+            if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.ShiftKey || e.KeyCode == Keys.Menu || e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin)
+                return;
+
+            // 生成修饰符掩码
+            uint mods = 0;
+            if (e.Control) mods |= MOD_CONTROL;
+            if (e.Alt) mods |= MOD_ALT;
+            if (e.Shift) mods |= MOD_SHIFT;
+            // Win key detection via ModifierKeys
+            if ((Control.ModifierKeys & Keys.LWin) == Keys.LWin || (Control.ModifierKeys & Keys.RWin) == Keys.RWin)
+                mods |= MOD_WIN;
+
+            _currentHotkeyModifiers = mods;
+            _currentHotkeyKey = e.KeyCode;
+
+            textBox2.Text = HotkeyToString(_currentHotkeyModifiers, _currentHotkeyKey);
+
+            if (checkBox4.Checked)
+            {
+                RegisterCurrentHotkey();
+                Log($"热键已更新为：{textBox2.Text}");
+            }
+        }
+
+        private void RegisterCurrentHotkey()
+        {
+            try
+            {
+                // 先注销任何已注册的
+                UnregisterHotKey(Handle, HOTKEY_ID);
+                bool ok = RegisterHotKey(Handle, HOTKEY_ID, _currentHotkeyModifiers, _currentHotkeyKey);
+                if (!ok)
+                {
+                    Log("注册热键失败（可能被其他程序占用）。");
+                    MessageBox.Show(this, "注册热键失败（可能被其他程序占用）。", "热键注册失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"注册热键异常：{ex}");
+            }
+        }
+
+        private static string HotkeyToString(uint mods, Keys key)
+        {
+            var parts = new List<string>();
+            if ((mods & MOD_CONTROL) != 0) parts.Add("Ctrl");
+            if ((mods & MOD_ALT) != 0) parts.Add("Alt");
+            if ((mods & MOD_SHIFT) != 0) parts.Add("Shift");
+            if ((mods & MOD_WIN) != 0) parts.Add("Win");
+            parts.Add(key.ToString());
+            return string.Join("+", parts);
+        }
+
+        private void OnHotKeyPressed()
+        {
+            try
+            {
+                // 打开窗口并让保存路径显示在 textBox1
+                if (!Visible || WindowState == FormWindowState.Minimized)
+                {
+                    Show();
+                    WindowState = FormWindowState.Normal;
+                    BringToFront();
+                    Activate();
+                }
+
+                if (string.IsNullOrWhiteSpace(textBox1.Text))
+                    textBox1.Text = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+
+                Log("热键触发：开始截图。");
+
+                // 热键触发时优先执行一次单次截图（不切换到自动模式）
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        this.Invoke(() =>
+                        {
+                            try
+                            {
+                                var file = CaptureAndSave(forceSingle: true);
+                                if (!string.IsNullOrEmpty(file))
+                                    Log($"热键截图已保存：{file}");
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"热键截图失败：{ex}");
+                            }
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        this.Invoke(() => Log($"启动热键截图任务失败：{ex}"));
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Log($"处理热键失败：{ex}");
+            }
+        }
+
+        private void Button1_Click(object? sender, EventArgs e)
+        {
+            using var dlg = new FolderBrowserDialog();
+            if (!string.IsNullOrWhiteSpace(textBox1.Text) && Directory.Exists(textBox1.Text))
+                dlg.SelectedPath = textBox1.Text;
+
+            if (dlg.ShowDialog() == DialogResult.OK)
+            {
+                textBox1.Text = dlg.SelectedPath;
+                Log($"已选择保存目录：{dlg.SelectedPath}");
+            }
+        }
+
+        private void Button2_Click(object? sender, EventArgs e)
+        {
+            var path = textBox1.Text;
+            if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+            {
+                MessageBox.Show(this, "保存目录不存在，请先选择有效目录。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"无法打开目录：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Log($"打开目录失败：{ex}");
+            }
+        }
+
+        private void Button3_Click(object? sender, EventArgs e)
+        {
+            // 启动单次截图或自动截图
+            if (checkBox6.Checked) // 自动截图
+            {
+                StartAutoCapture();
+            }
+            else
+            {
+                // 单次截图（支持倒计时）
+                StartSingleCapture();
+            }
+        }
+
+        private void StartSingleCapture()
+        {
+            int delaySeconds = (checkBox3.Checked) ? (int)numericUpDown1.Value : 0;
+            if (delaySeconds > 0)
+            {
+                Log($"开始倒计时：{delaySeconds} 秒...");
+            }
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    if (delaySeconds > 0)
+                        Thread.Sleep(delaySeconds * 1000);
+
+                    this.Invoke(() =>
+                    {
+                        try
+                        {
+                            var file = CaptureAndSave();
+                            if (!string.IsNullOrEmpty(file))
+                                Log($"截图已保存：{file}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"截图失败：{ex}");
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    this.Invoke(() => Log($"启动截图任务失败：{ex}"));
+                }
+            });
+        }
+
+        private void StartAutoCapture()
+        {
+            int intervalSeconds = (int)numericUpDown2.Value;
+            if (intervalSeconds <= 0)
+            {
+                MessageBox.Show(this, "请设置大于 0 的自动截图间隔。", "无效间隔", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (_autoTimer != null)
+            {
+                _autoTimer.Stop();
+                _autoTimer.Dispose();
+                _autoTimer = null;
+            }
+
+            _autoTimer = new System.Timers.Timer(intervalSeconds * 1000);
+            _autoTimer.Elapsed += AutoTimer_Elapsed;
+            _autoTimer.AutoReset = true;
+            _autoTimer.Start();
+
+            Log($"已开始自动截图：间隔 {intervalSeconds} 秒。再次点击可停止。");
+
+            // 将按钮3用作停止切换：如果再次点击且定时器存在则停止
+            button3.Click -= Button3_Click;
+            EventHandler? stopHandler = null;
+            stopHandler = (s, e) =>
+            {
+                _autoTimer?.Stop();
+                _autoTimer?.Dispose();
+                _autoTimer = null;
+                Log("已停止自动截图。");
+                // 恢复原先的单次截图绑定
+                button3.Click -= stopHandler!;
+                button3.Click += Button3_Click;
+            };
+            button3.Click += stopHandler;
+        }
+
+        private void AutoTimer_Elapsed(object? sender, ElapsedEventArgs e)
+        {
+            try
+            {
+                this.Invoke(() =>
+                {
+                    try
+                    {
+                        var file = CaptureAndSave();
+                        if (!string.IsNullOrEmpty(file))
+                            Log($"自动截图已保存：{file}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"自动截图失败：{ex}");
+                    }
+                });
+            }
+            catch (ObjectDisposedException) { }
+        }
+
+        /// <summary>
+        /// CaptureAndSave 增强说明：
+        /// - 支持通过 PrintWindow/BitBlt/Alt+PrintScreen 捕获所选窗口（若选择了 comboBox1 的窗口），否则使用当前活动窗口。
+        /// - 屏幕截图支持选择特定显示器（comboBox2），若未选择则使用虚拟屏幕。
+        /// - 当 forceSingle 为 true 时：忽略自动模式，始终执行单次截图（用于热键）。
+        /// </summary>
+        private string? CaptureAndSave(bool forceSingle = false)
+        {
+            // 确保存储目录
+            var folder = textBox1.Text;
+            if (string.IsNullOrWhiteSpace(folder))
+            {
+                folder = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+                textBox1.Text = folder;
+            }
+
+            if (!Directory.Exists(folder))
+                Directory.CreateDirectory(folder);
+
+            // 隐藏窗口以避免被包含（仅当选中）
+            var wasVisible = this.Visible;
+            if (checkBox1.Checked)
+            {
+                this.Visible = false;
+                Application.DoEvents();
+                Thread.Sleep(200);
+            }
+
+            Bitmap? bmp = null;
+            try
+            {
+                if (radioButton2.Checked) // 全屏或选择屏幕
+                {
+                    Rectangle bounds;
+                    if (comboBox2.SelectedItem is ScreenItem sitem)
+                        bounds = sitem.Bounds;
+                    else
+                        bounds = GetVirtualScreenBounds();
+
+                    bmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
+                    using var g = Graphics.FromImage(bmp);
+                    g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size, CopyPixelOperation.SourceCopy);
+                }
+                else if (radioButton1.Checked) // 窗口（可选 comboBox1 中选择的窗口）
+                {
+                    IntPtr hWnd = IntPtr.Zero;
+                    if (comboBox1.SelectedItem is WindowItem witem)
+                        hWnd = witem.Hwnd;
+                    else
+                        hWnd = GetForegroundWindow();
+
+                    var rect = GetWindowRectOrEmpty(hWnd);
+                    if (rect.Width <= 0 || rect.Height <= 0 || hWnd == IntPtr.Zero)
+                        throw new InvalidOperationException("无法获取目标窗口句柄或尺寸。");
+
+                    // 尝试多种窗口捕获方法，按可靠性和兼容性顺序
+                    bmp = TryCaptureWindowRobust(hWnd, rect);
+                    if (bmp == null)
+                        throw new InvalidOperationException("窗口捕获失败（所有方法均未成功）。");
+                }
+                else // 框选
+                {
+                    using var sel = new SelectionForm();
+                    if (sel.ShowDialog(this) == DialogResult.OK)
+                    {
+                        var r = sel.SelectedRectangle;
+                        if (r.Width <= 0 || r.Height <= 0)
+                            throw new InvalidOperationException("未选择有效区域。");
+
+                        bmp = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppArgb);
+                        using var g = Graphics.FromImage(bmp);
+                        g.CopyFromScreen(r.Location, Point.Empty, r.Size, CopyPixelOperation.SourceCopy);
+                    }
+                    else
+                    {
+                        Log("框选取消。");
+                    }
+                }
+
+                if (bmp == null)
+                {
+                    Log("未生成截图。");
+                    return null;
+                }
+
+                var filename = Path.Combine(folder, $"screenshot_{DateTime.Now:yyyyMMdd_HHmmss_fff}.png");
+                bmp.Save(filename, ImageFormat.Png);
+
+                // 复制到剪切板
+                if (checkBox2.Checked)
+                {
+                    try
+                    {
+                        Clipboard.SetImage(bmp);
+                        Log("已复制到剪切板。");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"复制到剪切板失败：{ex.Message}");
+                    }
+                }
+
+                // 打开图片
+                if (checkBox5.Checked)
+                {
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo { FileName = filename, UseShellExecute = true });
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"打开图片失败：{ex.Message}");
+                    }
+                }
+
+                return filename;
+            }
+            finally
+            {
+                bmp?.Dispose();
+                if (checkBox1.Checked && wasVisible)
+                {
+                    this.Visible = true;
+                }
+            }
+        }
+
+        // 尝试多种方法捕获窗口，返回一个有效 bitmap 或 null
+        private Bitmap? TryCaptureWindowRobust(IntPtr hWnd, Rectangle rect)
+        {
+            Bitmap? bmp = null;
+
+            // 1) 尝试 PrintWindow 带 PW_RENDERFULLCONTENT（2）
+            bmp = TryPrintWindow(hWnd, rect, 2);
+            if (bmp != null && !IsMostlyBlank(bmp)) return bmp;
+
+            bmp?.Dispose();
+
+            // 2) 尝试 PrintWindow 无标志
+            bmp = TryPrintWindow(hWnd, rect, 0);
+            if (bmp != null && !IsMostlyBlank(bmp)) return bmp;
+
+            bmp?.Dispose();
+
+            // 3) 尝试 BitBlt 从窗口 DC（适用于很多场景）
+            try
+            {
+                var bt = TryBitBltWindow(hWnd, rect);
+                if (bt != null && !IsMostlyBlank(bt)) return bt;
+                bt?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log($"BitBlt 捕获异常：{ex.Message}");
+            }
+
+            // 4) 如果以上均失败，尝试模拟 Alt+PrintScreen（将窗口置前，系统会把活动窗口图像复制到剪贴板）
+            try
+            {
+                var altBmp = TryAltPrintScreenCapture(hWnd, rect);
+                if (altBmp != null && !IsMostlyBlank(altBmp)) return altBmp;
+                altBmp?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log($"Alt+PrtSc 捕获异常：{ex.Message}");
+            }
+
+            return null;
+        }
+
+        // 使用 PrintWindow 到指定大小的 bitmap；flags 通常为 2 (PW_RENDERFULLCONTENT) 或 0
+        private Bitmap? TryPrintWindow(IntPtr hWnd, Rectangle rect, int flags)
+        {
+            Bitmap bmp = new Bitmap(rect.Width, rect.Height, PixelFormat.Format32bppArgb);
+            try
+            {
+                using var g = Graphics.FromImage(bmp);
+                IntPtr hdc = g.GetHdc();
+                try
+                {
+                    bool ok = PrintWindow(hWnd, hdc, flags);
+                    g.ReleaseHdc(hdc);
+                    if (!ok)
+                    {
+                        // PrintWindow 返回 false，表示无法直接打印
+                        return bmp; // 返回 bmp（后续会检测是否白）
+                    }
+                    return bmp;
+                }
+                catch
+                {
+                    try { g.ReleaseHdc(hdc); } catch { }
+                    return bmp;
+                }
+            }
+            catch
+            {
+                bmp.Dispose();
+                return null;
+            }
+        }
+
+        // 使用 BitBlt 从窗口 DC 捕获（通常能捕获更多窗口类型）
+        private Bitmap? TryBitBltWindow(IntPtr hWnd, Rectangle rect)
+        {
+            IntPtr hWndDC = IntPtr.Zero;
+            IntPtr hMemDC = IntPtr.Zero;
+            IntPtr hBitmap = IntPtr.Zero;
+            IntPtr hOld = IntPtr.Zero;
+
+            try
+            {
+                hWndDC = GetWindowDC(hWnd);
+                if (hWndDC == IntPtr.Zero) return null;
+
+                hMemDC = CreateCompatibleDC(hWndDC);
+                if (hMemDC == IntPtr.Zero) return null;
+
+                hBitmap = CreateCompatibleBitmap(hWndDC, rect.Width, rect.Height);
+                if (hBitmap == IntPtr.Zero) return null;
+
+                hOld = SelectObject(hMemDC, hBitmap);
+                // 从窗口 DC 复制
+                bool success = BitBlt(hMemDC, 0, 0, rect.Width, rect.Height, hWndDC, rect.Left, rect.Top, SRCCOPY);
+                // 恢复
+                SelectObject(hMemDC, hOld);
+
+                if (!success)
+                    return null;
+
+                // 从 HBITMAP 创建 Image
+                Bitmap bmp = Image.FromHbitmap(hBitmap);
+                // 注意：Image.FromHbitmap 会创建 GDI 对象的副本，之后可以释放 hBitmap
+                return bmp;
+            }
+            finally
+            {
+                if (hBitmap != IntPtr.Zero) DeleteObject(hBitmap);
+                if (hMemDC != IntPtr.Zero) DeleteDC(hMemDC);
+                if (hWndDC != IntPtr.Zero) ReleaseDC(hWnd, hWndDC);
+            }
+        }
+
+        // 模拟 Alt+PrintScreen：将目标窗口置前，发送按键，读取剪切板图像，恢复原窗口
+        private Bitmap? TryAltPrintScreenCapture(IntPtr hWnd, Rectangle rect)
+        {
+            if (hWnd == IntPtr.Zero) return null;
+
+            IntPtr originalForeground = GetForegroundWindow();
+            try
+            {
+                // 还原并置前
+                ShowWindow(hWnd, SW_RESTORE);
+                SetForegroundWindow(hWnd);
+
+                // 等待窗口置前并刷新
+                Application.DoEvents();
+                Thread.Sleep(150);
+
+                // 发送 Alt down, PrintScreen, Alt up
+                keybd_event(VK_MENU, 0, 0, UIntPtr.Zero); // Alt down
+                keybd_event(VK_SNAPSHOT, 0, 0, UIntPtr.Zero); // PrtSc down/up
+                keybd_event(VK_SNAPSHOT, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero); // Alt up
+
+                // 等待剪切板准备好
+                Thread.Sleep(200);
+
+                if (Clipboard.ContainsImage())
+                {
+                    var img = Clipboard.GetImage();
+                    if (img == null) return null;
+
+                    // Clipboard image is the active window; may be same size or include borders.
+                    // 如果需要裁切为 window rect（推荐）：将 img 转为 Bitmap 并裁切中心区域或靠 rect 尺寸
+                    try
+                    {
+                        var bmp = new Bitmap(img);
+                        // 如果剪切板图像大小匹配窗口大小，直接返回；否则尝试裁切
+                        if (bmp.Width == rect.Width && bmp.Height == rect.Height)
+                          return bmp;
+
+                        // 尝试定位窗口位于屏幕上的位置：rect.Location 是屏幕坐标
+                        // 剪切板 image 通常等于窗口客户区（不含任务栏等）
+                        // 保守处理：如果剪切板比窗口大，从剪切板中心裁出窗口尺寸
+                        if (bmp.Width >= rect.Width && bmp.Height >= rect.Height)
+                        {
+                            int x = Math.Max(0, (bmp.Width - rect.Width) / 2);
+                            int y = Math.Max(0, (bmp.Height - rect.Height) / 2);
+                            var crop = bmp.Clone(new Rectangle(x, y, rect.Width, rect.Height), bmp.PixelFormat);
+                            bmp.Dispose();
+                            return crop;
+                        }
+
+                        return bmp;
+                    }
+                    catch
+                    {
+                        return null;
+                    }
+                }
+
+                return null;
+            }
+            finally
+            {
+                // 恢复原先窗口
+                if (originalForeground != IntPtr.Zero)
+                {
+                    try
+                    {
+                        SetForegroundWindow(originalForeground);
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        // 检查 bitmap 是否几乎全部白色（用于检测 PrintWindow 导致的“全白”问题）
+        private static bool IsMostlyBlank(Bitmap bmp)
+        {
+            try
+            {
+                // 抽样若干点（中心和四角）
+                var points = new List<Point>
+                {
+                    new Point(bmp.Width/2, bmp.Height/2),
+                    new Point(1,1),
+                    new Point(Math.Max(0,bmp.Width-2),1),
+                    new Point(1,Math.Max(0,bmp.Height-2)),
+                    new Point(Math.Max(0,bmp.Width-2),Math.Max(0,bmp.Height-2))
+                };
+
+                int whiteCount = 0;
+                foreach (var p in points)
+                {
+                    if (p.X < 0 || p.X >= bmp.Width || p.Y < 0 || p.Y >= bmp.Height) continue;
+                    var c = bmp.GetPixel(p.X, p.Y);
+                    if (c.A == 0) // fully transparent treat as blank
+                        whiteCount++;
+                    else if (c.R > 240 && c.G > 240 && c.B > 240) // near white
+                        whiteCount++;
+                }
+
+                return whiteCount >= Math.Min(points.Count, 3);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void Button4_Click(object? sender, EventArgs e)
+        {
+            using var sfd = new SaveFileDialog
+            {
+                Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+                FileName = $"log_{DateTime.Now:yyyyMMdd_HHmmss}.txt",
+                Title = "保存日志"
+            };
+
+            if (sfd.ShowDialog(this) == DialogResult.OK)
+            {
+                try
+                {
+                    File.WriteAllText(sfd.FileName, richTextBox1.Text);
+                    Log($"日志已保存到：{sfd.FileName}");
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, $"保存日志失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    Log($"保存日志失败：{ex}");
+                }
+            }
+        }
+
+        private void Log(string text)
+        {
+            var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}";
+            richTextBox1.AppendText(line + Environment.NewLine);
+            // 自动滚动到底部
+            richTextBox1.SelectionStart = richTextBox1.TextLength;
+            richTextBox1.ScrollToCaret();
+        }
+
+        // ----- 窗口 / 屏幕 列表功能 -----
+        private void PopulateTopLevelWindows()
+        {
+            try
+            {
+                comboBox1.Items.Clear();
+                EnumWindows((hWnd, lParam) =>
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+                    int length = GetWindowTextLength(hWnd);
+                    if (length == 0) return true;
+                    var sb = new System.Text.StringBuilder(length + 1);
+                    GetWindowText(hWnd, sb, sb.Capacity);
+                    string title = sb.ToString();
+                    if (string.IsNullOrWhiteSpace(title)) return true;
+                    comboBox1.Items.Add(new WindowItem(hWnd, title));
+                    return true;
+                }, IntPtr.Zero);
+
+                // 选中第一个项目（如果有）
+                if (comboBox1.Items.Count > 0 && comboBox1.SelectedIndex < 0)
+                    comboBox1.SelectedIndex = 0;
+            }
+            catch (Exception ex)
+            {
+                Log($"刷新窗口列表失败：{ex.Message}");
+            }
+        }
+
+        private void PopulateScreens()
+        {
+            try
+            {
+                comboBox2.Items.Clear();
+                var screens = Screen.AllScreens;
+                for (int i = 0; i < screens.Length; i++)
+                {
+                    comboBox2.Items.Add(new ScreenItem(i, screens[i]));
+                }
+
+                // 默认选择主显示器
+                for (int i = 0; i < comboBox2.Items.Count; i++)
+                {
+                    if (comboBox2.Items[i] is ScreenItem si && si.Bounds == Screen.PrimaryScreen.Bounds)
+                    {
+                        comboBox2.SelectedIndex = i;
+                        break;
+                    }
+                }
+                if (comboBox2.SelectedIndex < 0 && comboBox2.Items.Count > 0)
+                    comboBox2.SelectedIndex = 0;
+            }
+            catch (Exception ex)
+            {
+                Log($"刷新显示器列表失败：{ex.Message}");
+            }
+        }
+
+        // ----- 辅助：获取指定窗口矩形 -----
+        private static Rectangle GetWindowRectOrEmpty(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return Rectangle.Empty;
+            if (!GetWindowRect(hWnd, out RECT r)) return Rectangle.Empty;
+            return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+        }
+
+        // ----- P/Invoke -----
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, Keys vk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        [DllImport("user32.dll")]
+        private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, int nFlags);
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        // window DC / GDI
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindowDC(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+        [DllImport("gdi32.dll")]
+        private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+
+        [DllImport("gdi32.dll")]
+        private static extern IntPtr CreateCompatibleBitmap(IntPtr hdc, int nWidth, int nHeight);
+
+        [DllImport("gdi32.dll")]
+        private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
+
+        [DllImport("gdi32.dll")]
+        private static extern bool DeleteObject(IntPtr hObject);
+
+        [DllImport("gdi32.dll")]
+        private static extern bool DeleteDC(IntPtr hdc);
+
+        [DllImport("gdi32.dll")]
+        private static extern bool BitBlt(IntPtr hdcDest, int nXDest, int nYDest, int nWidth, int nHeight,
+            IntPtr hdcSrc, int nXSrc, int nYSrc, uint dwRop);
+
+        // keyboard / window manipulation
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left; public int Top; public int Right; public int Bottom;
+        }
+
+        // ----- 辅助类型 -----
+        private sealed class WindowItem
+        {
+            public IntPtr Hwnd { get; }
+            public string Title { get; }
+
+            public WindowItem(IntPtr hWnd, string title)
+            {
+                Hwnd = hWnd;
+                Title = title;
+            }
+
+            public override string ToString() => $"{Title} (0x{Hwnd.ToInt64():X})";
+        }
+
+        private sealed class ScreenItem
+        {
+            public int Index { get; }
+            public Rectangle Bounds { get; }
+            public string Name { get; }
+
+            public ScreenItem(int index, Screen s)
+            {
+                Index = index;
+                Bounds = s.Bounds;
+                Name = s.DeviceName;
+            }
+
+            public override string ToString() => $"显示器 {Index}: {Name} {Bounds.Width}x{Bounds.Height} @ {Bounds.Location}";
+        }
+
+        // 内部类：用于框选截图的半透明覆盖窗体（已补回，修复编译错误）
+        private sealed class SelectionForm : Form
+        {
+            private Point _start;
+            private Point _current;
+            private bool _selecting;
+            public Rectangle SelectedRectangle { get; private set; }
+
+            public SelectionForm()
+            {
+                DoubleBuffered = true;
+                FormBorderStyle = FormBorderStyle.None;
+                StartPosition = FormStartPosition.Manual;
+                Bounds = GetVirtualScreenBounds();
+                BackColor = Color.Black;
+                Opacity = 0.25;
+                TopMost = true;
+                ShowInTaskbar = false;
+                Cursor = Cursors.Cross;
+
+                MouseDown += SelectionForm_MouseDown;
+                MouseMove += SelectionForm_MouseMove;
+                MouseUp += SelectionForm_MouseUp;
+                KeyDown += SelectionForm_KeyDown;
+            }
+
+            private void SelectionForm_KeyDown(object? sender, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    DialogResult = DialogResult.Cancel;
+                    Close();
+                }
+            }
+
+            private void SelectionForm_MouseDown(object? sender, MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Left) return;
+                _selecting = true;
+                // 使用窗体坐标（窗体覆盖虚拟屏幕），后面会 Offset 到屏幕坐标
+                _start = e.Location;
+                _current = e.Location;
+                SelectedRectangle = Rectangle.Empty;
+            }
+
+            private void SelectionForm_MouseMove(object? sender, MouseEventArgs e)
+            {
+                if (!_selecting) return;
+                _current = e.Location;
+                Invalidate();
+            }
+
+            private void SelectionForm_MouseUp(object? sender, MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Left) return;
+                _selecting = false;
+                var r = GetRectangle(_start, _current);
+                // 转换为屏幕坐标（窗体可能覆盖多显示器）
+                r.Offset(Bounds.Location);
+                SelectedRectangle = r;
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                if (_selecting)
+                {
+                    var r = GetRectangle(_start, _current);
+                    using var pen = new Pen(Color.Red, 2);
+                    e.Graphics.DrawRectangle(pen, r);
+                }
+            }
+
+            private static Rectangle GetRectangle(Point a, Point b)
+            {
+                return new Rectangle(
+                    Math.Min(a.X, b.X),
+                    Math.Min(a.Y, b.Y),
+                    Math.Abs(a.X - b.X),
+                    Math.Abs(a.Y - b.Y));
+            }
+        }
+
+        // 辅助：获取虚拟屏幕总范围
+        private static Rectangle GetVirtualScreenBounds()
+        {
+            int left = SystemInformation.VirtualScreen.Left;
+            int top = SystemInformation.VirtualScreen.Top;
+            int width = SystemInformation.VirtualScreen.Width;
+            int height = SystemInformation.VirtualScreen.Height;
+            return new Rectangle(left, top, width, height);
+        }
+    }
+}
