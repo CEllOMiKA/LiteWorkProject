@@ -76,24 +76,39 @@ public class Main : Form
         private Point _current;
 
         private bool _selecting;
+        private readonly Image? _backgroundImage;
 
         public Rectangle SelectedRectangle { get; private set; }
 
-        public SelectionForm()
+        // backgroundImage: if provided, used as frozen background
+        public SelectionForm(Image? backgroundImage = null)
         {
             DoubleBuffered = true;
-            base.FormBorderStyle = FormBorderStyle.None;
-            base.StartPosition = FormStartPosition.Manual;
-            base.Bounds = GetVirtualScreenBounds();
-            BackColor = Color.Black;
-            base.Opacity = 0.25;
-            base.TopMost = true;
-            base.ShowInTaskbar = false;
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            Bounds = GetVirtualScreenBounds();
+            _backgroundImage = backgroundImage;
+
+            if (_backgroundImage != null)
+            {
+                BackgroundImage = _backgroundImage;
+                BackgroundImageLayout = ImageLayout.None;
+                Opacity = 1.0;
+            }
+            else
+            {
+                BackColor = Color.Black;
+                Opacity = 0.25;
+            }
+
+            TopMost = true;
+            ShowInTaskbar = false;
             Cursor = Cursors.Cross;
-            base.MouseDown += SelectionForm_MouseDown;
-            base.MouseMove += SelectionForm_MouseMove;
-            base.MouseUp += SelectionForm_MouseUp;
-            base.KeyDown += SelectionForm_KeyDown;
+
+            MouseDown += SelectionForm_MouseDown;
+            MouseMove += SelectionForm_MouseMove;
+            MouseUp += SelectionForm_MouseUp;
+            KeyDown += SelectionForm_KeyDown;
         }
 
         private void SelectionForm_KeyDown(object? sender, KeyEventArgs e)
@@ -109,6 +124,7 @@ public class Main : Form
         {
             if (e.Button == MouseButtons.Left)
             {
+                // 进入拖拽选择模式
                 _selecting = true;
                 _start = e.Location;
                 _current = e.Location;
@@ -131,12 +147,17 @@ public class Main : Form
             {
                 _selecting = false;
                 Rectangle r = GetRectangle(_start, _current);
-                r.Offset(base.Bounds.Location);
+                r.Offset(Bounds.Location);
+
+                // normal behavior: use dragged rectangle
+
                 SelectedRectangle = r;
-                base.DialogResult = DialogResult.OK;
+                DialogResult = DialogResult.OK;
                 Close();
             }
         }
+
+        
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -152,6 +173,15 @@ public class Main : Form
         private static Rectangle GetRectangle(Point a, Point b)
         {
             return new Rectangle(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                try { _backgroundImage?.Dispose(); } catch { }
+            }
+            base.Dispose(disposing);
         }
     }
 
@@ -262,7 +292,7 @@ public class Main : Form
     private Button button6;
 
     private Button button5;
-
+    private CheckBox checkBox9;
     private CheckBox checkBox8;
 
     public Main()
@@ -915,7 +945,23 @@ public class Main : Form
                 }
                 try
                 {
-                    using SelectionForm sel = new SelectionForm();
+                    Image? bg = null;
+                    // 如果勾选了 checkBox9（截图时使画面静止），先截取虚拟屏幕作为背景
+                    try
+                    {
+                        if (checkBox9 != null && checkBox9.Checked)
+                        {
+                            var vb = GetVirtualScreenBounds();
+                            bg = new Bitmap(vb.Width, vb.Height, PixelFormat.Format32bppArgb);
+                            using (var gg = Graphics.FromImage(bg))
+                            {
+                                gg.CopyFromScreen(vb.Location, Point.Empty, vb.Size, CopyPixelOperation.SourceCopy);
+                            }
+                        }
+                    }
+                    catch { bg?.Dispose(); bg = null; }
+
+                    using SelectionForm sel = new SelectionForm(bg);
                     if (sel.ShowDialog(this) == DialogResult.OK)
                     {
                         Rectangle r = sel.SelectedRectangle;
@@ -1535,6 +1581,7 @@ public class Main : Form
         Title = new Label();
         SaveLocationLabel = new Label();
         Panel = new Panel();
+        checkBox9 = new CheckBox();
         checkBox8 = new CheckBox();
         button6 = new Button();
         label3 = new Label();
@@ -1595,6 +1642,7 @@ public class Main : Form
         // Panel
         // 
         Panel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        Panel.Controls.Add(checkBox9);
         Panel.Controls.Add(checkBox8);
         Panel.Controls.Add(button6);
         Panel.Controls.Add(label3);
@@ -1627,6 +1675,16 @@ public class Main : Form
         Panel.Size = new Size(1097, 380);
         Panel.TabIndex = 2;
         // 
+        // checkBox9
+        // 
+        checkBox9.AutoSize = true;
+        checkBox9.Location = new Point(135, 293);
+        checkBox9.Name = "checkBox9";
+        checkBox9.Size = new Size(180, 28);
+        checkBox9.TabIndex = 36;
+        checkBox9.Text = "截图时使画面静止";
+        checkBox9.UseVisualStyleBackColor = true;
+        // 
         // checkBox8
         // 
         checkBox8.AutoSize = true;
@@ -1656,7 +1714,7 @@ public class Main : Form
         label3.Name = "label3";
         label3.Size = new Size(161, 24);
         label3.TabIndex = 33;
-        label3.Text = "v1.1 ©CEllOMiKA";
+        label3.Text = "v1.2 ©CEllOMiKA";
         // 
         // label2
         // 
